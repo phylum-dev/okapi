@@ -273,6 +273,23 @@ pub struct Parameter {
     pub extensions: Object,
 }
 
+impl Parameter {
+    pub fn basic(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            location: "".to_owned(),
+            description: None,
+            required: false,
+            deprecated: false,
+            allow_empty_value: true,
+            value: ParameterValue::Content {
+                content: schemars::Map::new(),
+            },
+            extensions: Object::default(),
+        }
+    }
+}
+
 // maybe this should just been inlined into Parameter as fields?
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[cfg_attr(feature = "impl_json_schema", derive(JsonSchema))]

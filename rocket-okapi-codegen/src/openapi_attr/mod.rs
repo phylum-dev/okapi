@@ -1,7 +1,9 @@
 mod doc_attr;
 mod route_attr;
+mod schema_rule;
 
 use crate::get_add_operation_fn_name;
+use schema_rule::SchemaRule;
 use darling::FromMeta;
 use proc_macro::TokenStream;
 use proc_macro2::Span;
@@ -18,9 +20,13 @@ use syn::{
 #[darling(default)]
 struct OpenApiAttribute {
     pub skip: bool,
+    pub noschema: bool,
 
     #[darling(multiple, rename = "tag")]
-    pub tags: Vec<String>,
+    pub tags: Vec<String>,   
+
+    #[darling(multiple)]
+    pub whitelist: Vec<String>,
 }
 
 pub fn parse(args: TokenStream, input: TokenStream) -> TokenStream {
@@ -38,8 +44,14 @@ pub fn parse(args: TokenStream, input: TokenStream) -> TokenStream {
         return create_empty_route_operation_fn(input);
     }
 
+    let schema_rule = if okapi_attr.noschema {
+        SchemaRule::from_whitelist(okapi_attr.whitelist)
+    } else {
+        SchemaRule::All
+    };
+
     match route_attr::parse_attrs(&input.attrs) {
-        Ok(route) => create_route_operation_fn(input, route, okapi_attr.tags),
+        Ok(route) => create_route_operation_fn(input, route, okapi_attr.tags, schema_rule),
         Err(e) => e,
     }
 }
@@ -110,11 +122,16 @@ fn create_route_operation_fn(
     route_fn: ItemFn,
     route: route_attr::Route,
     tags: Vec<String>,
+    schema_rule: SchemaRule,
 ) -> TokenStream {
     let arg_types = get_arg_types(route_fn.sig.inputs.into_iter());
-    let return_type = match route_fn.sig.output {
-        ReturnType::Type(_, ty) => type_replace_impl_trait(*ty),
-        ReturnType::Default => unit_type(),
+    let return_type = if !schema_rule.check("return") {
+        unit_type()
+    } else {
+        match route_fn.sig.output {
+            ReturnType::Type(_, ty) => type_replace_impl_trait(*ty),
+            ReturnType::Default => unit_type(),
+        }
     };
 
     // ----- Check route info -----
@@ -137,10 +154,18 @@ fn create_route_operation_fn(
             }
             .into(),
         };
+
         params_names_used.push(arg.to_owned());
-        params.push(quote! {
-            <#ty as ::rocket_okapi::request::OpenApiFromParam>::path_parameter(gen, #arg.to_owned())?.into()
-        })
+
+        if !schema_rule.check(arg) {
+            params.push(quote! {
+                ::okapi::openapi3::RefOr::Object(::okapi::openapi3::Parameter::basic(#arg))
+            });
+        } else {        
+            params.push(quote! {
+                <#ty as ::rocket_okapi::request::OpenApiFromParam>::path_parameter(gen, #arg.to_owned())?.into()
+            });
+        }
     }
     // Multi Path parameters: `/<path..>`
     if let Some(arg) = route.path_multi_param() {
@@ -151,10 +176,18 @@ fn create_route_operation_fn(
             }
             .into(),
         };
+
         params_names_used.push(arg.to_owned());
-        params.push(quote! {
-            <#ty as ::rocket_okapi::request::OpenApiFromSegments>::path_multi_parameter(gen, #arg.to_owned())?.into()
-        })
+
+        if !schema_rule.check(arg) {
+            params.push(quote! {
+                ::okapi::openapi3::RefOr::Object(::okapi::openapi3::Parameter::basic(#arg))
+            });
+        } else {
+            params.push(quote! {
+                <#ty as ::rocket_okapi::request::OpenApiFromSegments>::path_multi_parameter(gen, #arg.to_owned())?.into()
+            });
+        }
     }
     // Query parameters: `/?<id>&<name>`
     for arg in route.query_params() {
@@ -165,10 +198,18 @@ fn create_route_operation_fn(
             }
             .into(),
         };
+        
         params_names_used.push(arg.to_owned());
-        params_nested_list.push(quote! {
-            <#ty as ::rocket_okapi::request::OpenApiFromForm>::form_multi_parameter(gen, #arg.to_owned(), true)?.into()
-        })
+
+        if !schema_rule.check(arg) {
+            params_nested_list.push(quote! {
+                vec![::okapi::openapi3::Parameter::basic(#arg)]
+            });
+        } else {
+            params_nested_list.push(quote! {
+                <#ty as ::rocket_okapi::request::OpenApiFromForm>::form_multi_parameter(gen, #arg.to_owned(), true)?.into()
+            });
+        }
     }
     // Multi Query parameters: `/?<param..>`
     for arg in route.query_multi_params() {
@@ -178,10 +219,18 @@ fn create_route_operation_fn(
                 compile_error!(concat!("Could not find argument ", #arg, " matching multi query param."));
             }.into(),
         };
+
         params_names_used.push(arg.to_owned());
-        params_nested_list.push(quote! {
-            <#ty as ::rocket_okapi::request::OpenApiFromForm>::form_multi_parameter(gen, #arg.to_owned(), true)?.into()
-        })
+
+        if !schema_rule.check(arg) {
+            params_nested_list.push(quote! {
+                vec![::okapi::openapi3::Parameter::basic(#arg)]
+            });
+        } else {
+            params_nested_list.push(quote! {
+                <#ty as ::rocket_okapi::request::OpenApiFromForm>::form_multi_parameter(gen, #arg.to_owned(), true)?.into()
+            });
+        }
     }
 
     // -- Body Data --
@@ -194,10 +243,23 @@ fn create_route_operation_fn(
                     compile_error!(concat!("Could not find argument ", #data_param, " matching data param."));
                 }.into()
             };
+
             // Add parameter to list
             params_names_used.push(data_param.clone());
-            quote! {
-                Some(<#ty as ::rocket_okapi::request::OpenApiFromData>::request_body(gen)?.into())
+            
+            if !schema_rule.check(data_param) {
+                quote! { 
+                    Some(::okapi::openapi3::RefOr::Object(::okapi::openapi3::RequestBody {
+                        description: None,
+                        content: ::schemars::Map::new(),
+                        required: false,
+                        extensions: ::schemars::Map::new(),
+                    }))
+                }
+            } else {
+                quote! {
+                    Some(<#ty as ::rocket_okapi::request::OpenApiFromData>::request_body(gen)?.into())
+                }
             }
         }
         None => quote! { None },
@@ -209,12 +271,26 @@ fn create_route_operation_fn(
     for (arg, ty) in &arg_types {
         if !params_names_used.contains(arg) {
             params_names_used.push(arg.to_owned());
-            params_request_guards.push(quote! {
-                <#ty as ::rocket_okapi::request::OpenApiFromRequest>::from_request_input(gen, #arg.to_owned(), true)?.into()
-            });
-            request_guard_responses.push(quote! {
-                <#ty as ::rocket_okapi::request::OpenApiFromRequest>::get_responses(gen)?.into()
-            });
+
+            if !schema_rule.check(arg) {
+                params_request_guards.push(quote! {
+                    ::rocket_okapi::request::RequestHeaderInput::None
+                });
+                request_guard_responses.push(quote! {
+                    ::okapi::openapi3::Responses {
+                        default: None,
+                        responses: ::schemars::Map::new(),
+                        extensions: ::schemars::Map::new(),
+                    }
+                });
+            } else {
+                params_request_guards.push(quote! {
+                    <#ty as ::rocket_okapi::request::OpenApiFromRequest>::from_request_input(gen, #arg.to_owned(), true)?.into()
+                });
+                request_guard_responses.push(quote! {
+                    <#ty as ::rocket_okapi::request::OpenApiFromRequest>::get_responses(gen)?.into()
+                });
+            }
         }
     }
 
